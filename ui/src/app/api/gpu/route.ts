@@ -138,8 +138,9 @@ async function getGpuInfo() {
 
   // Check if nvidia-smi is available
   const hasNvidiaSmi = await checkNvidiaSmi(isWindows);
+    const hasAmdSmi = await checkAMDSmi(isWindows);
 
-  if (!hasNvidiaSmi) {
+  if (!hasNvidiaSmi && !hasAmdSmi) {
     return {
       hasNvidiaSmi: false,
       isMac: false,
@@ -149,12 +150,19 @@ async function getGpuInfo() {
   }
 
   // Get GPU stats
-  const gpuStats = await getGpuStats(isWindows);
-
-  return {
-    hasNvidiaSmi: true,
-    gpus: gpuStats,
-  };
+  if (hasNvidiaSmi) {
+      const gpuStats = await getGpuStats(isWindows);
+      return NextResponse.json({
+        hasNvidiaSmi: true,
+        gpus: gpuStats,
+      });
+    } else {
+      const gpuStats = await getAMDGpuStats(isWindows);
+      return {
+        hasNvidiaSmi: true,
+        gpus: gpuStats,
+      };
+  }
 }
 
 export async function GET() {
@@ -162,7 +170,7 @@ export async function GET() {
     const gpuInfo = await cached('gpu-info', getGpuInfo);
     return NextResponse.json(gpuInfo);
   } catch (error) {
-    console.error('Error fetching NVIDIA GPU stats:', error);
+    console.error('Error fetching GPU stats:', error);
     return NextResponse.json(
       {
         hasNvidiaSmi: false,
@@ -185,6 +193,17 @@ async function checkNvidiaSmi(isWindows: boolean): Promise<boolean> {
     } else {
       // Linux/macOS check
       await execAsync('which nvidia-smi');
+    }
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+async function checkAMDSmi(isWindows: boolean): Promise<boolean> {
+  try {
+    if (!isWindows) {
+      // Linux/macOS check
+      await execAsync('which amd-smi');
     }
     return true;
   } catch (error) {
@@ -251,6 +270,136 @@ async function getGpuStats(isWindows: boolean) {
         },
       };
     });
+
+  return gpus;
+}
+
+// amdParseFloat and amdParseInt avoid errors when amd-smi entries
+// contain the string "N/A".
+function amdParseFloat(value) {
+    try {
+        const ret = parseFloat(value);
+        return ret;
+    } catch(error) {
+        return 0.0;
+    }
+}
+
+function amdParseInt(value) {
+    try {
+        const ret = parseInt(value);
+        return ret;
+    } catch(error) {
+        return 0;
+    }
+}
+
+async function getAMDGpuStats(isWindows: boolean) {
+  // Execute command
+  //const command = 'amd-smi static --json && echo ";" && amd-smi metric --json';
+  const command = 'amd-smi static --json && echo ";{}"';
+  // Execute command
+  const { stdout } = await execAsync(command, {
+    env: { ...process.env, CUDA_DEVICE_ORDER: 'PCI_BUS_ID' },
+  });
+  var data = stdout.split(';');
+
+  var sdata = {};
+  var mdata = {};
+  try {
+      sdata = JSON.parse(data[0]);
+      mdata = JSON.parse(data[1]);
+  } catch (error) {
+    console.error('Failed to parse output of amd-smi returned json: ', error);
+    return [];
+  }
+
+  // Handle null/undefined gpu_data
+  if (!sdata["gpu_data"] || !Array.isArray(sdata["gpu_data"])) {
+    return [];
+  }
+
+  var gpus = sdata["gpu_data"].filter(
+    it => it && it["asic"] && it["asic"]["market_name"] !== "AMD Radeon Graphics"
+  ).map(d => {
+    const i = amdParseInt(d["gpu"]);
+    const gpu_data = mdata && mdata["gpu_data"] && mdata["gpu_data"][i];
+    
+    // Handle null/undefined gpu_data
+    if (!gpu_data) {
+      return {
+        index: i,
+        name: d && d["asic"] ? d["asic"]["market_name"] : "Unknown GPU",
+        driverVersion: d && d["driver"] ? d["driver"]["version"] : "Unknown",
+        temperature: 0,
+        utilization: {
+          gpu: 0,
+          memory: 0,
+        },
+        memory: {
+          total: 0,
+          used: 0,
+          free: 0,
+        },
+        power: {
+          draw: 0,
+          limit: 0,
+        },
+        clocks: {
+          graphics: 0,
+          memory: 0,
+        },
+        fan: {
+          speed: 0,
+        }
+      };
+    }
+
+    const mem_total = amdParseFloat(gpu_data["mem_usage"]?.["total_vram"]?.["value"] || "0");
+    const mem_used =  amdParseFloat(gpu_data["mem_usage"]?.["used_vram"]?.["value"] || "0");
+    const mem_free =  amdParseFloat(gpu_data["mem_usage"]?.["free_visible_vram"]?.["value"] || "0");
+    const mem_utilization = mem_total > 0 ? ((mem_total - mem_free) / mem_total) * 100 : 0;
+
+    return {
+      index: i,
+      name: d && d["asic"] ? d["asic"]["market_name"] : "Unknown GPU",
+      driverVersion: d && d["driver"] ? d["driver"]["version"] : "Unknown",
+      temperature: amdParseInt(gpu_data["temperature"]?.["hotspot"]?.["value"] || "0"),
+      utilization: {
+        gpu: amdParseInt(gpu_data["usage"]?.["gfx_activity"]?.["value"] || "0"),
+        memory: mem_utilization,
+      },
+      memory: {
+        total: mem_total,
+        used:  mem_used,
+        free:  mem_free,
+      },
+      power: {
+        draw: amdParseFloat(gpu_data["power"]?.["socket_power"]?.["value"] || "0"),
+        limit: amdParseFloat(() => {
+        try {
+          if (d && d["limit"]) {
+            if (d["limit"]["max_power"]) {
+              return d["limit"]["max_power"]["value"];
+            } else if (d["limit"]["ppt0"] && d["limit"]["ppt0"]["max_power_limit"]) {
+              return d["limit"]["ppt0"]["max_power_limit"]["value"];
+            }
+          }
+          return "0";
+        } catch (error) {
+          return "0";
+        }
+	})
+      },
+      clocks: {
+        graphics: amdParseInt(gpu_data["clock"]?.["gfx_0"]?.["clk"]?.["value"] || "0"),
+        memory: amdParseInt(gpu_data["clock"]?.["mem_0"]?.["clk"]?.["value"] || "0"),
+      },
+      fan: {
+        speed: amdParseFloat(gpu_data["fan"]?.["usage"]?.["value"] || "0"),
+      }
+    };
+  });
 
   return gpus;
 }
